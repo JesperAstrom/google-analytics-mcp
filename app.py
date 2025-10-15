@@ -16,11 +16,10 @@ from google.analytics.data_v1beta import (
 )
 
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")
-app = FastAPI(title="GA4 MCP HTTP Server", version="1.1.0")
+app = FastAPI(title="GA4 MCP HTTP Server", version="1.2.0")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Auth helper
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────── Auth ───────────────────────────
 def require_bearer(request: Request) -> None:
     if not AUTH_TOKEN:
         raise HTTPException(status_code=500, detail="Server missing MCP_AUTH_TOKEN")
@@ -32,9 +31,7 @@ def require_bearer(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Shared GA4 logic
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────── GA4 helpers (shared) ───────────────
 def build_dimension_filter(args: Dict[str, Any]) -> Optional[FilterExpression]:
     """Supports a simple equality filter for eventName."""
     df = args.get("dimensionFilter")
@@ -66,7 +63,7 @@ def run_ga4_report(args: Dict[str, Any]) -> Dict[str, Any]:
     limit = int(args.get("limit", 1000))
     dim_filter = build_dimension_filter(args)
 
-    client = BetaAnalyticsDataClient()  # uses Cloud Run SA via ADC
+    client = BetaAnalyticsDataClient()  # ADC via Cloud Run service account
     req = RunReportRequest(
         property=prop,
         metrics=metrics_in,
@@ -90,17 +87,13 @@ def run_ga4_report(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "rowCount": len(rows), "rows": rows}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Health
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────── Health ───────────────
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "ga4-mcp-http"}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Legacy endpoints (for curl)
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────── Legacy endpoints (curl-friendly) ─────────
 @app.get("/tools")
 async def legacy_tools(request: Request):
     require_bearer(request)
@@ -120,12 +113,18 @@ async def legacy_tools(request: Request):
                         },
                         "metrics": {
                             "type": "array",
-                            "items": {"type": "object", "properties": {"name": {"type": "string"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {"name": {"type": "string"}},
+                            },
                             "example": [{"name": "activeUsers"}],
                         },
                         "dimensions": {
                             "type": "array",
-                            "items": {"type": "object", "properties": {"name": {"type": "string"}}},
+                            "items": {
+                                "type": "object",
+                                "properties": {"name": {"type": "string"}},
+                            },
                             "example": [{"name": "date"}],
                         },
                         "dateRanges": {
@@ -170,15 +169,8 @@ async def legacy_call(request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MCP HTTP Transport — POST /
-#   Accepts:
-#     {"id":"1","method":"tools/list","params":{}}
-#     {"id":"2","method":"tools/call","params":{"name":"run_report","arguments":{...}}}
-#   Returns:
-#     {"id":"1","result":{"tools":[...]}}
-#     {"id":"2","result":{"content":[{"type":"json","data":{...}}]}}
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────── MCP HTTP transport (POST /) ───────────────
+# Supports: initialize, ping, tools/list, tools/call
 @app.post("/")
 async def mcp_http(request: Request):
     require_bearer(request)
@@ -192,14 +184,34 @@ async def mcp_http(request: Request):
     params = payload.get("params", {}) or {}
 
     if not method:
-        raise HTTPException(status_code=400, detail="Missing 'method'")
+        return JSONResponse(
+            {"id": req_id, "error": {"code": 400, "message": "Missing 'method'"}},
+            status_code=400,
+        )
 
-    # tools/list
+    # Handshake
+    if method == "initialize":
+        return JSONResponse(
+            {
+                "id": req_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {"name": "ga4-mcp-http", "version": "1.2.0"},
+                    "capabilities": {"tools": {}},
+                },
+            }
+        )
+
+    # Keep-alive
+    if method == "ping":
+        return JSONResponse({"id": req_id, "result": {}})
+
+    # List tools
     if method == "tools/list":
-        tools = (await legacy_tools(request))["tools"]  # reuse same tool description
+        tools = (await legacy_tools(request))["tools"]
         return JSONResponse({"id": req_id, "result": {"tools": tools}})
 
-    # tools/call
+    # Call tool
     if method == "tools/call":
         name = params.get("name")
         if name != "run_report":
@@ -210,7 +222,6 @@ async def mcp_http(request: Request):
         args = params.get("arguments", {}) or {}
         try:
             result = run_ga4_report(args)
-            # MCP content payload — simple JSON wrapper
             return JSONResponse(
                 {"id": req_id, "result": {"content": [{"type": "json", "data": result}]}}
             )
