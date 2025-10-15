@@ -1,0 +1,3 @@
+fastapi
+uvicorn
+google-analytics-data
