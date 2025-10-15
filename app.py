@@ -15,18 +15,14 @@ from google.analytics.data_v1beta import (
     Filter,
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config / Auth
-# ──────────────────────────────────────────────────────────────────────────────
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")
+app = FastAPI(title="GA4 MCP HTTP Server", version="1.1.0")
 
-app = FastAPI(title="GA4 MCP HTTP Server", version="1.0.0")
-
-
-def check_auth(request: Request) -> None:
-    """Enforce 'Authorization: Bearer <token>' with env MCP_AUTH_TOKEN."""
+# ──────────────────────────────────────────────────────────────────────────────
+# Auth helper
+# ──────────────────────────────────────────────────────────────────────────────
+def require_bearer(request: Request) -> None:
     if not AUTH_TOKEN:
-        # This is a server config error; surface loudly so you fix env/secret.
         raise HTTPException(status_code=500, detail="Server missing MCP_AUTH_TOKEN")
     header = request.headers.get("authorization", "")
     if not header.startswith("Bearer "):
@@ -37,35 +33,65 @@ def check_auth(request: Request) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utility: build optional dimension filter (supports eventName equality)
-# Extend here if you need more filters.
+# Shared GA4 logic
 # ──────────────────────────────────────────────────────────────────────────────
 def build_dimension_filter(args: Dict[str, Any]) -> Optional[FilterExpression]:
-    """
-    args may include:
-      "dimensionFilter": { "eventName": "purchase" }
-    This builds a FilterExpression: eventName == "purchase"
-    """
+    """Supports a simple equality filter for eventName."""
     df = args.get("dimensionFilter")
     if not df:
         return None
-
-    # Only support simple equality for eventName for now; extend as needed.
-    event_name = df.get("eventName")
-    if event_name:
+    if "eventName" in df and df["eventName"]:
         return FilterExpression(
             filter=Filter(
                 field_name="eventName",
-                string_filter=Filter.StringFilter(value=event_name, match_type=Filter.StringFilter.MatchType.EXACT),
+                string_filter=Filter.StringFilter(
+                    value=df["eventName"],
+                    match_type=Filter.StringFilter.MatchType.EXACT,
+                ),
             )
         )
-
-    # If present but unrecognized, ignore rather than fail hard.
     return None
 
 
+def run_ga4_report(args: Dict[str, Any]) -> Dict[str, Any]:
+    # Required
+    prop = args["property"]  # "properties/<NUMERIC_ID>"
+    metrics_in = [Metric(name=m["name"]) for m in args["metrics"]]
+    date_ranges_in = [
+        DateRange(start_date=r["startDate"], end_date=r["endDate"])
+        for r in args["dateRanges"]
+    ]
+    # Optional
+    dims_in = [Dimension(name=d["name"]) for d in args.get("dimensions", [])]
+    limit = int(args.get("limit", 1000))
+    dim_filter = build_dimension_filter(args)
+
+    client = BetaAnalyticsDataClient()  # uses Cloud Run SA via ADC
+    req = RunReportRequest(
+        property=prop,
+        metrics=metrics_in,
+        dimensions=dims_in,
+        date_ranges=date_ranges_in,
+        limit=limit,
+        dimension_filter=dim_filter,
+    )
+    resp = client.run_report(req)
+
+    headers = [h.name for h in resp.dimension_headers] + [
+        h.name for h in resp.metric_headers
+    ]
+    rows: List[Dict[str, Any]] = []
+    for r in resp.rows:
+        vals = [v.string_value for v in r.dimension_values] + [
+            m.value for m in r.metric_values
+        ]
+        rows.append({k: v for k, v in zip(headers, vals)})
+
+    return {"ok": True, "rowCount": len(rows), "rows": rows}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Health / Root
+# Health
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
@@ -73,11 +99,11 @@ async def root():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MCP: List Tools
+# Legacy endpoints (for curl)
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/tools")
-async def list_tools(request: Request):
-    check_auth(request)
+async def legacy_tools(request: Request):
+    require_bearer(request)
     return {
         "tools": [
             {
@@ -89,7 +115,7 @@ async def list_tools(request: Request):
                     "properties": {
                         "property": {
                             "type": "string",
-                            "description": "GA4 property resource name: 'properties/<NUMERIC_ID>'",
+                            "description": "GA4 property resource: 'properties/<NUMERIC_ID>'",
                             "example": "properties/123456789",
                         },
                         "metrics": {
@@ -117,7 +143,7 @@ async def list_tools(request: Request):
                         "limit": {"type": "integer", "default": 1000},
                         "dimensionFilter": {
                             "type": "object",
-                            "description": 'Optional simple filter. Currently supports {"eventName":"purchase"}',
+                            "description": 'Optional simple filter. Example: {"eventName":"purchase"}',
                             "example": {"eventName": "purchase"},
                         },
                     },
@@ -127,58 +153,80 @@ async def list_tools(request: Request):
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MCP: Call Tool
-# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/call")
-async def call_tool(request: Request):
-    check_auth(request)
-    body: Dict[str, Any] = await request.json()
-
+async def legacy_call(request: Request):
+    require_bearer(request)
+    body = await request.json()
     tool = body.get("toolName")
     if tool != "run_report":
         raise HTTPException(status_code=400, detail=f"Unknown tool: {tool}")
-
-    args: Dict[str, Any] = body.get("arguments", {})
-
-    # Parse required args
+    args = body.get("arguments", {})
     try:
-        prop = args["property"]  # "properties/<NUMERIC_ID>"
-        metrics_in = [Metric(name=m["name"]) for m in args["metrics"]]
-        date_ranges_in = [
-            DateRange(start_date=r["startDate"], end_date=r["endDate"]) for r in args["dateRanges"]
-        ]
+        result = run_ga4_report(args)
+        return JSONResponse(result)
     except KeyError as e:
         raise HTTPException(status_code=400, detail=f"Missing required field: {e.args[0]}")
-
-    # Optional args
-    dims_in = [Dimension(name=d["name"]) for d in args.get("dimensions", [])]
-    limit = int(args.get("limit", 1000))
-    dim_filter = build_dimension_filter(args)
-
-    # Call GA4 Data API using ADC (Cloud Run service account)
-    try:
-        client = BetaAnalyticsDataClient()
-        req = RunReportRequest(
-            property=prop,
-            metrics=metrics_in,
-            dimensions=dims_in,
-            date_ranges=date_ranges_in,
-            limit=limit,
-            dimension_filter=dim_filter,
-        )
-        resp = client.run_report(req)
-
-        # Flatten response rows into a list of dicts
-        headers = [h.name for h in resp.dimension_headers] + [h.name for h in resp.metric_headers]
-        rows: List[Dict[str, Any]] = []
-        for r in resp.rows:
-            vals = [v.string_value for v in r.dimension_values] + [m.value for m in r.metric_values]
-            rows.append({k: v for k, v in zip(headers, vals)})
-
-        return JSONResponse({"ok": True, "rowCount": len(rows), "rows": rows})
-
     except Exception as e:
-        # Surface the exact error to the client for easier debugging
-        # (e.g., PERMISSION_DENIED, INVALID_ARGUMENT, NOT_FOUND)
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MCP HTTP Transport — POST /
+#   Accepts:
+#     {"id":"1","method":"tools/list","params":{}}
+#     {"id":"2","method":"tools/call","params":{"name":"run_report","arguments":{...}}}
+#   Returns:
+#     {"id":"1","result":{"tools":[...]}}
+#     {"id":"2","result":{"content":[{"type":"json","data":{...}}]}}
+# ──────────────────────────────────────────────────────────────────────────────
+@app.post("/")
+async def mcp_http(request: Request):
+    require_bearer(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    req_id = payload.get("id")
+    method = payload.get("method")
+    params = payload.get("params", {}) or {}
+
+    if not method:
+        raise HTTPException(status_code=400, detail="Missing 'method'")
+
+    # tools/list
+    if method == "tools/list":
+        tools = (await legacy_tools(request))["tools"]  # reuse same tool description
+        return JSONResponse({"id": req_id, "result": {"tools": tools}})
+
+    # tools/call
+    if method == "tools/call":
+        name = params.get("name")
+        if name != "run_report":
+            return JSONResponse(
+                {"id": req_id, "error": {"code": 400, "message": f"Unknown tool: {name}"}},
+                status_code=400,
+            )
+        args = params.get("arguments", {}) or {}
+        try:
+            result = run_ga4_report(args)
+            # MCP content payload — simple JSON wrapper
+            return JSONResponse(
+                {"id": req_id, "result": {"content": [{"type": "json", "data": result}]}}
+            )
+        except KeyError as e:
+            return JSONResponse(
+                {"id": req_id, "error": {"code": 400, "message": f"Missing required field: {e.args[0]}"}},
+                status_code=400,
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"id": req_id, "error": {"code": 400, "message": str(e)}},
+                status_code=400,
+            )
+
+    # Unknown method
+    return JSONResponse(
+        {"id": req_id, "error": {"code": 400, "message": f"Unknown method: {method}"}},
+        status_code=400,
+    )
